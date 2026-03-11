@@ -70,7 +70,7 @@ export const newsletterQualityScorer = createScorer({
     // Normalize 1-10 to 0-1 for Mastra's scorer framework
     return (r.overallScore ?? 5) / 10;
   })
-  .generateReason(({ results, score }) => {
+  .generateReason(({ results, score: _score }) => {
     const r = (results as any)?.analyzeStepResult || {};
     return `Newsletter quality: ${r.overallScore ?? 'N/A'}/10. Strengths: ${r.strengths ?? 'N/A'}. Weaknesses: ${r.weaknesses ?? 'N/A'}.`;
   });
@@ -96,7 +96,7 @@ export async function scoreNewsletter(
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'gpt-4.1-mini',
+      model: 'gpt-5-mini',
       response_format: { type: 'json_object' },
       messages: [
         {

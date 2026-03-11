@@ -1,10 +1,14 @@
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
+import type { Mastra } from '@mastra/core/mastra';
 import { exaSearchTool } from '../tools/exa-search-tool';
 import { browserbaseTool } from '../tools/browserbase-tool';
 import { tavilySearchTool } from '../tools/tavily-search-tool';
+import { writeFileTool } from '../tools/write-file-tool';
 import { scoreArticlesBatch } from '../scorers/news-scorer';
 import { scoreNewsletter } from '../scorers/newsletter-quality-scorer';
+
+// --- Shared schemas ---
 
 const articleSchema = z.object({
   title: z.string(),
@@ -29,14 +33,8 @@ const sectionSchema = z.object({
 });
 
 type Article = z.infer<typeof articleSchema>;
+type ScoredArticle = z.infer<typeof scoredArticleSchema>;
 
-// Helper to safely extract articles from tool result (handles ValidationError union)
-function extractArticles(result: any): any[] {
-  if (result && 'articles' in result) return result.articles;
-  return [];
-}
-
-// Schema for the quality-scored newsletter output
 const qualityScoredOutputSchema = z.object({
   markdown: z.string(),
   filePath: z.string(),
@@ -47,188 +45,116 @@ const qualityScoredOutputSchema = z.object({
   weaknesses: z.string(),
 });
 
-// Step 1a: Search with Exa
-const exaSearchStep = createStep({
-  id: 'exa-search',
-  description: 'Search for news articles using Exa',
-  inputSchema: z.object({ topic: z.string() }),
-  outputSchema: z.object({ articles: z.array(articleSchema) }),
-  execute: async ({ inputData }) => {
-    const ctx = {} as any;
-    const [result1, result2] = await Promise.all([
-      exaSearchTool.execute!({ query: `${inputData.topic} latest news`, numResults: 10 }, ctx),
-      exaSearchTool.execute!({ query: `${inputData.topic} breaking`, numResults: 10 }, ctx),
-    ]);
+// --- Shared helpers ---
 
-    const allArticles = [...extractArticles(result1), ...extractArticles(result2)];
+function extractArticles(result: any): any[] {
+  if (result && 'articles' in result) return result.articles;
+  return [];
+}
 
-    const seen = new Set<string>();
-    const unique = allArticles.filter((a: Article) => {
-      if (seen.has(a.url)) return false;
-      seen.add(a.url);
-      return true;
-    });
+function deduplicateArticles(articles: Article[]): Article[] {
+  const seen = new Set<string>();
+  return articles.filter((a) => {
+    const normalizedUrl = a.url?.replace(/\/$/, '').toLowerCase();
+    if (!normalizedUrl || seen.has(normalizedUrl)) return false;
+    seen.add(normalizedUrl);
+    return true;
+  });
+}
 
-    return { articles: unique };
-  },
+const organizerOutputSchema = z.object({
+  sections: z.array(
+    z.object({
+      name: z.string(),
+      theme: z.string(),
+      articleIndices: z.array(z.number()),
+    }),
+  ),
 });
 
-// Step 1b: Search with Browserbase
-const browserbaseSearchStep = createStep({
-  id: 'browserbase-search',
-  description: 'Browse news sites using Browserbase',
-  inputSchema: z.object({ topic: z.string() }),
-  outputSchema: z.object({ articles: z.array(articleSchema) }),
-  execute: async ({ inputData }) => {
-    const encodedTopic = encodeURIComponent(inputData.topic);
-    const urls = [
-      `https://news.google.com/search?q=${encodedTopic}&hl=en-US&gl=US&ceid=US:en`,
-      `https://www.reuters.com/search/news?query=${encodedTopic}`,
-      `https://apnews.com/search?q=${encodedTopic}`,
-    ];
+// --- Shared pipeline function (fix #3) ---
+// Used by both the main workflow steps and the retry branch.
 
-    const ctx = {} as any;
-    const result = await browserbaseTool.execute!({ urls }, ctx);
-    const rawArticles = extractArticles(result);
-    const articles = rawArticles.map((a: any) => ({
+async function searchAllSources(topic: string): Promise<Article[]> {
+  const ctx = {} as any;
+
+  // Fix #2: Each search is wrapped in try/catch for resilience
+  const [exaResult1, exaResult2, tavilyResult, bbResult] = await Promise.all([
+    exaSearchTool.execute!({ query: `${topic} latest news`, numResults: 10 }, ctx).catch((err) => {
+      console.warn(`Exa search (latest) failed: ${err.message}`);
+      return { articles: [] };
+    }),
+    exaSearchTool.execute!({ query: `${topic} breaking`, numResults: 10 }, ctx).catch((err) => {
+      console.warn(`Exa search (breaking) failed: ${err.message}`);
+      return { articles: [] };
+    }),
+    tavilySearchTool.execute!({ query: `${topic} news`, maxResults: 10 }, ctx).catch((err) => {
+      console.warn(`Tavily search failed: ${err.message}`);
+      return { articles: [] };
+    }),
+    browserbaseTool.execute!({
+      urls: [
+        `https://news.google.com/search?q=${encodeURIComponent(topic)}&hl=en-US&gl=US&ceid=US:en`,
+        `https://www.reuters.com/search/news?query=${encodeURIComponent(topic)}`,
+        `https://apnews.com/search?q=${encodeURIComponent(topic)}`,
+      ],
+    }, ctx).catch((err) => {
+      console.warn(`Browserbase search failed: ${err.message}`);
+      return { articles: [] };
+    }),
+  ]);
+
+  const allArticles: Article[] = [
+    ...extractArticles(exaResult1),
+    ...extractArticles(exaResult2),
+    ...extractArticles(tavilyResult),
+    ...extractArticles(bbResult).map((a: any) => ({
       title: a.title,
       url: a.url,
       summary: a.content?.slice(0, 500) || '',
       source: new URL(a.url).hostname,
       publishedDate: a.scrapedAt,
-    }));
+    })),
+  ];
 
-    return { articles };
-  },
-});
+  return deduplicateArticles(allArticles);
+}
 
-// Step 1c: Search with Tavily
-const tavilySearchStep = createStep({
-  id: 'tavily-search',
-  description: 'Search for news articles using Tavily',
-  inputSchema: z.object({ topic: z.string() }),
-  outputSchema: z.object({ articles: z.array(articleSchema) }),
-  execute: async ({ inputData }) => {
-    const ctx = {} as any;
-    const result = await tavilySearchTool.execute!(
-      { query: `${inputData.topic} news`, maxResults: 10 },
-      ctx,
-    );
+async function scoreAndRankArticles(
+  articles: Article[],
+  topic: string,
+): Promise<ScoredArticle[]> {
+  const scoredArticles: ScoredArticle[] = [];
 
-    return { articles: extractArticles(result) };
-  },
-});
-
-// Step 2: Merge and deduplicate results
-const mergeResultsStep = createStep({
-  id: 'merge-results',
-  description: 'Merge and deduplicate articles from all search sources',
-  inputSchema: z.object({
-    'exa-search': z.object({ articles: z.array(articleSchema) }),
-    'browserbase-search': z.object({ articles: z.array(articleSchema) }),
-    'tavily-search': z.object({ articles: z.array(articleSchema) }),
-  }),
-  outputSchema: z.object({
-    articles: z.array(articleSchema),
-    topic: z.string(),
-  }),
-  execute: async ({ inputData }) => {
-    const allArticles = [
-      ...(inputData['exa-search']?.articles || []),
-      ...(inputData['browserbase-search']?.articles || []),
-      ...(inputData['tavily-search']?.articles || []),
-    ];
-
-    // Deduplicate by URL
-    const seen = new Set<string>();
-    const unique = allArticles.filter((a) => {
-      const normalizedUrl = a.url.replace(/\/$/, '').toLowerCase();
-      if (seen.has(normalizedUrl)) return false;
-      seen.add(normalizedUrl);
-      return true;
-    });
-
-    return { articles: unique, topic: '' };
-  },
-});
-
-// Step 3: Score articles
-const scoreArticlesStep = createStep({
-  id: 'score-articles',
-  description: 'Score articles on timeliness, novelty, and urgency',
-  inputSchema: z.object({
-    articles: z.array(articleSchema),
-    topic: z.string(),
-  }),
-  outputSchema: z.object({
-    scoredArticles: z.array(scoredArticleSchema),
-    topic: z.string(),
-  }),
-  execute: async ({ inputData }) => {
-    const { articles, topic } = inputData;
-    const scoredArticles: z.infer<typeof scoredArticleSchema>[] = [];
-
-    // Score in batches of 5
-    for (let i = 0; i < articles.length; i += 5) {
-      const batch = articles.slice(i, i + 5);
-      const scores = await scoreArticlesBatch(batch, topic);
-
-      for (let j = 0; j < batch.length; j++) {
-        const article = batch[j];
-        const scoreData = scores[j] || { timeliness: 0.5, novelty: 0.5, urgency: 0.5, score: 0.5 };
-        scoredArticles.push({
-          ...article,
-          ...scoreData,
-        });
-      }
+  for (let i = 0; i < articles.length; i += 5) {
+    const batch = articles.slice(i, i + 5);
+    const scores = await scoreArticlesBatch(batch, topic);
+    for (let j = 0; j < batch.length; j++) {
+      const scoreData = scores[j] || { timeliness: 0.5, novelty: 0.5, urgency: 0.5, score: 0.5 };
+      scoredArticles.push({ ...batch[j], ...scoreData });
     }
+  }
 
-    // Sort by score descending, keep top 20
-    scoredArticles.sort((a, b) => b.score - a.score);
-    const topArticles = scoredArticles.slice(0, 20);
+  scoredArticles.sort((a, b) => b.score - a.score);
+  return scoredArticles.slice(0, 20);
+}
 
-    return { scoredArticles: topArticles, topic };
-  },
-});
+async function organizeIntoSections(
+  scoredArticles: ScoredArticle[],
+  topic: string,
+  mastra: Mastra,
+): Promise<Array<{ name: string; theme: string; articles: ScoredArticle[] }>> {
+  const agent = mastra.getAgent('newsOrganizerAgent');
+  if (!agent) throw new Error('News organizer agent not found');
 
-// Step 4: Organize into themed sections
-const organizeStoriesStep = createStep({
-  id: 'organize-stories',
-  description: 'Organize scored articles into themed sections with creative subheaders',
-  inputSchema: z.object({
-    scoredArticles: z.array(scoredArticleSchema),
-    topic: z.string(),
-  }),
-  outputSchema: z.object({
-    sections: z.array(sectionSchema),
-    topic: z.string(),
-  }),
-  execute: async ({ inputData, mastra }) => {
-    const agent = mastra?.getAgent('newsOrganizerAgent');
-    if (!agent) throw new Error('News organizer agent not found');
+  const articleList = scoredArticles
+    .map((a, i) => `[${i}] "${a.title}" (score: ${a.score.toFixed(2)}) - ${a.summary.slice(0, 200)}`)
+    .join('\n');
 
-    const articleList = inputData.scoredArticles
-      .map(
-        (a, i) =>
-          `[${i}] "${a.title}" (score: ${a.score.toFixed(2)}) - ${a.summary.slice(0, 200)}`,
-      )
-      .join('\n');
-
-    const outputSchema = z.object({
-      sections: z.array(
-        z.object({
-          name: z.string(),
-          theme: z.string(),
-          articleIndices: z.array(z.number()),
-        }),
-      ),
-    });
-
-    const response = await agent.generate(
-      [
-        {
-          role: 'user' as const,
-          content: `Organize these ${inputData.scoredArticles.length} articles about "${inputData.topic}" into 3-4 themed sections. Each section needs a descriptive name and a creative, witty subheader.
+  const response = await agent.generate(
+    [{
+      role: 'user' as const,
+      content: `Organize these ${scoredArticles.length} articles about "${topic}" into 3-4 themed sections. Each section needs a descriptive name and a creative, witty subheader.
 
 Articles:
 ${articleList}
@@ -245,64 +171,55 @@ Return a JSON object with this structure:
 }
 
 Every article index must appear in exactly one section.`,
-        },
-      ],
-      {
-        structuredOutput: {
-          schema: outputSchema,
-        },
-      },
-    );
+    }],
+    { structuredOutput: { schema: organizerOutputSchema } },
+  );
 
-    const organized = (response.object?.sections || []).map((section) => ({
-      name: section.name,
-      theme: section.theme,
-      articles: (section.articleIndices || [])
-        .filter((idx) => idx < inputData.scoredArticles.length)
-        .map((idx) => inputData.scoredArticles[idx]),
-    }));
+  return (response.object?.sections || []).map((section) => ({
+    name: section.name,
+    theme: section.theme,
+    articles: (section.articleIndices || [])
+      .filter((idx) => idx < scoredArticles.length)
+      .map((idx) => scoredArticles[idx]),
+  }));
+}
 
-    return { sections: organized, topic: inputData.topic };
-  },
-});
+async function writeNewsletterMarkdown(
+  sections: Array<{ name: string; theme: string; articles: ScoredArticle[] }>,
+  topic: string,
+  mastra: Mastra,
+  options?: { isRetry?: boolean; previousWeaknesses?: string; previousScore?: number },
+): Promise<{ markdown: string; filePath: string }> {
+  const agent = mastra.getAgent('newsletterWriterAgent');
+  if (!agent) throw new Error('Newsletter writer agent not found');
 
-// Step 5: Write the newsletter
-const writeNewsletterStep = createStep({
-  id: 'write-newsletter',
-  description: 'Compile the final markdown newsletter and write to file',
-  inputSchema: z.object({
-    sections: z.array(sectionSchema),
-    topic: z.string(),
-  }),
-  outputSchema: z.object({
-    markdown: z.string(),
-    filePath: z.string(),
-    topic: z.string(),
-  }),
-  execute: async ({ inputData, mastra }) => {
-    const agent = mastra?.getAgent('newsletterWriterAgent');
-    if (!agent) throw new Error('Newsletter writer agent not found');
+  const sectionsText = sections
+    .map((s) => {
+      const articleDetails = s.articles
+        .map(
+          (a) =>
+            `- "${a.title}" | URL: ${a.url} | Source: ${a.source || 'unknown'} | Score: ${a.score.toFixed(2)}\n  Summary: ${a.summary.slice(0, 300)}`,
+        )
+        .join('\n');
+      return `## ${s.name}\n*${s.theme}*\n\n${articleDetails}`;
+    })
+    .join('\n\n');
 
-    const sectionsText = inputData.sections
-      .map((s) => {
-        const articleDetails = s.articles
-          .map(
-            (a) =>
-              `- "${a.title}" | URL: ${a.url} | Source: ${a.source || 'unknown'} | Score: ${a.score.toFixed(2)}\n  Summary: ${a.summary.slice(0, 300)}`,
-          )
-          .join('\n');
-        return `## ${s.name}\n*${s.theme}*\n\n${articleDetails}`;
-      })
-      .join('\n\n');
+  const today = new Date().toISOString().split('T')[0];
+  const topicSlug = topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  const suffix = options?.isRetry ? '-retry' : '';
+  const fileName = `${topicSlug}-${today}${suffix}.md`;
 
-    const today = new Date().toISOString().split('T')[0];
-    const topicSlug = inputData.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-    const fileName = `${topicSlug}-${today}.md`;
+  const retryContext = options?.isRetry
+    ? `\n\nIMPORTANT: This is a RETRY. The previous version scored ${options.previousScore}/10. Weaknesses: ${options.previousWeaknesses}. Address these issues.`
+    : '';
 
-    const response = await agent.generate([
-      {
-        role: 'user' as const,
-        content: `Write a complete markdown newsletter about "${inputData.topic}" for ${today}.
+  // Fix #8: Tell the writer how many articles we actually have
+  const articleCount = sections.reduce((sum, s) => sum + s.articles.length, 0);
+
+  const response = await agent.generate([{
+    role: 'user' as const,
+    content: `Write a complete markdown newsletter about "${topic}" for ${today}.
 
 Here are the organized sections with articles:
 
@@ -316,14 +233,245 @@ Requirements:
 - For each article, write a 2-3 sentence summary and include a [Source](url) link
 - End with a witty sign-off
 - The newsletter should be professional, engaging, and informative
+- Cover all ${articleCount} articles provided${retryContext}`,
+  }]);
 
-After writing the newsletter content, use the write-file tool to save it with the filename "${fileName}".`,
-      },
-    ]);
+  const markdown = response.text || '';
 
-    const markdown = response.text || '';
+  // Fix #7: Write file directly instead of relying on the agent to call the tool
+  const filePath = `./reports/${fileName}`;
+  const ctx = {} as any;
+  const writeResult = await writeFileTool.execute!({ content: markdown, filePath: fileName }, ctx);
+  if (writeResult && 'success' in writeResult && !writeResult.success) {
+    console.warn('Failed to write newsletter file');
+  }
 
-    return { markdown, filePath: `./reports/${fileName}`, topic: inputData.topic };
+  return { markdown, filePath };
+}
+
+/** Run the full pipeline from search to scored newsletter */
+async function runNewsPipeline(
+  topic: string,
+  mastra: Mastra,
+  options?: { isRetry?: boolean; previousWeaknesses?: string; previousScore?: number },
+): Promise<{ markdown: string; filePath: string; qualityScore: number }> {
+  // 1. Search
+  const articles = await searchAllSources(topic);
+
+  // Fix #8: Article count validation
+  if (articles.length === 0) {
+    throw new Error(`No articles found for topic "${topic}". Try a broader or different topic.`);
+  }
+  if (articles.length < 5) {
+    console.warn(`Only ${articles.length} articles found for "${topic}" — newsletter may be thin.`);
+  }
+  if (articles.length < 15) {
+    console.warn(`Found ${articles.length} articles (fewer than 15 target) for "${topic}".`);
+  }
+
+  // 2. Score and rank
+  const scoredArticles = await scoreAndRankArticles(articles, topic);
+
+  // 3. Organize
+  const sections = await organizeIntoSections(scoredArticles, topic, mastra);
+
+  // 4. Write
+  const { markdown, filePath } = await writeNewsletterMarkdown(sections, topic, mastra, options);
+
+  // 5. Quality score
+  const evaluation = await scoreNewsletter(markdown, topic);
+
+  return { markdown, filePath, qualityScore: evaluation.overallScore };
+}
+
+// --- Workflow steps ---
+
+// Step 1a: Search with Exa (fix #1: passes topic through, fix #2: try/catch)
+const exaSearchStep = createStep({
+  id: 'exa-search',
+  description: 'Search for news articles using Exa',
+  inputSchema: z.object({ topic: z.string() }),
+  outputSchema: z.object({ articles: z.array(articleSchema), topic: z.string() }),
+  execute: async ({ inputData }) => {
+    try {
+      const ctx = {} as any;
+      const [result1, result2] = await Promise.all([
+        exaSearchTool.execute!({ query: `${inputData.topic} latest news`, numResults: 10 }, ctx),
+        exaSearchTool.execute!({ query: `${inputData.topic} breaking`, numResults: 10 }, ctx),
+      ]);
+
+      const allArticles = [...extractArticles(result1), ...extractArticles(result2)];
+      const unique = deduplicateArticles(allArticles);
+
+      return { articles: unique, topic: inputData.topic };
+    } catch (err: any) {
+      console.warn(`Exa search step failed: ${err.message}`);
+      return { articles: [], topic: inputData.topic };
+    }
+  },
+});
+
+// Step 1b: Search with Browserbase (fix #1, #2)
+const browserbaseSearchStep = createStep({
+  id: 'browserbase-search',
+  description: 'Browse news sites using Browserbase',
+  inputSchema: z.object({ topic: z.string() }),
+  outputSchema: z.object({ articles: z.array(articleSchema), topic: z.string() }),
+  execute: async ({ inputData }) => {
+    try {
+      const encodedTopic = encodeURIComponent(inputData.topic);
+      const urls = [
+        `https://news.google.com/search?q=${encodedTopic}&hl=en-US&gl=US&ceid=US:en`,
+        `https://www.reuters.com/search/news?query=${encodedTopic}`,
+        `https://apnews.com/search?q=${encodedTopic}`,
+      ];
+
+      const ctx = {} as any;
+      const result = await browserbaseTool.execute!({ urls }, ctx);
+      const rawArticles = extractArticles(result);
+      const articles = rawArticles.map((a: any) => ({
+        title: a.title,
+        url: a.url,
+        summary: a.content?.slice(0, 500) || '',
+        source: new URL(a.url).hostname,
+        publishedDate: a.scrapedAt,
+      }));
+
+      return { articles, topic: inputData.topic };
+    } catch (err: any) {
+      console.warn(`Browserbase search step failed: ${err.message}`);
+      return { articles: [], topic: inputData.topic };
+    }
+  },
+});
+
+// Step 1c: Search with Tavily (fix #1, #2)
+const tavilySearchStep = createStep({
+  id: 'tavily-search',
+  description: 'Search for news articles using Tavily',
+  inputSchema: z.object({ topic: z.string() }),
+  outputSchema: z.object({ articles: z.array(articleSchema), topic: z.string() }),
+  execute: async ({ inputData }) => {
+    try {
+      const ctx = {} as any;
+      const result = await tavilySearchTool.execute!(
+        { query: `${inputData.topic} news`, maxResults: 10 },
+        ctx,
+      );
+
+      return { articles: extractArticles(result), topic: inputData.topic };
+    } catch (err: any) {
+      console.warn(`Tavily search step failed: ${err.message}`);
+      return { articles: [], topic: inputData.topic };
+    }
+  },
+});
+
+// Step 2: Merge and deduplicate (fix #1: reads topic from search results, fix #8: validates count)
+const mergeResultsStep = createStep({
+  id: 'merge-results',
+  description: 'Merge and deduplicate articles from all search sources',
+  inputSchema: z.object({
+    'exa-search': z.object({ articles: z.array(articleSchema), topic: z.string() }),
+    'browserbase-search': z.object({ articles: z.array(articleSchema), topic: z.string() }),
+    'tavily-search': z.object({ articles: z.array(articleSchema), topic: z.string() }),
+  }),
+  outputSchema: z.object({
+    articles: z.array(articleSchema),
+    topic: z.string(),
+  }),
+  execute: async ({ inputData }) => {
+    // Fix #1: Read topic from any search result (they all carry it through)
+    const topic =
+      inputData['exa-search']?.topic ||
+      inputData['browserbase-search']?.topic ||
+      inputData['tavily-search']?.topic ||
+      '';
+
+    const allArticles = [
+      ...(inputData['exa-search']?.articles || []),
+      ...(inputData['browserbase-search']?.articles || []),
+      ...(inputData['tavily-search']?.articles || []),
+    ];
+
+    const unique = deduplicateArticles(allArticles);
+
+    // Fix #8: Article count validation
+    const exaCount = inputData['exa-search']?.articles?.length || 0;
+    const bbCount = inputData['browserbase-search']?.articles?.length || 0;
+    const tavilyCount = inputData['tavily-search']?.articles?.length || 0;
+    console.log(`Search results — Exa: ${exaCount}, Browserbase: ${bbCount}, Tavily: ${tavilyCount} → ${unique.length} unique articles`);
+
+    if (unique.length === 0) {
+      throw new Error(`No articles found for topic "${topic}". All search sources returned empty results. Try a broader or different topic.`);
+    }
+
+    if (unique.length < 5) {
+      console.warn(`Only ${unique.length} unique articles found for "${topic}" — newsletter quality may be limited.`);
+    }
+
+    return { articles: unique, topic };
+  },
+});
+
+// Step 3: Score articles
+const scoreArticlesStep = createStep({
+  id: 'score-articles',
+  description: 'Score articles on timeliness, novelty, and urgency',
+  inputSchema: z.object({
+    articles: z.array(articleSchema),
+    topic: z.string(),
+  }),
+  outputSchema: z.object({
+    scoredArticles: z.array(scoredArticleSchema),
+    topic: z.string(),
+  }),
+  execute: async ({ inputData }) => {
+    const scored = await scoreAndRankArticles(inputData.articles, inputData.topic);
+    return { scoredArticles: scored, topic: inputData.topic };
+  },
+});
+
+// Step 4: Organize into themed sections
+const organizeStoriesStep = createStep({
+  id: 'organize-stories',
+  description: 'Organize scored articles into themed sections with creative subheaders',
+  inputSchema: z.object({
+    scoredArticles: z.array(scoredArticleSchema),
+    topic: z.string(),
+  }),
+  outputSchema: z.object({
+    sections: z.array(sectionSchema),
+    topic: z.string(),
+  }),
+  execute: async ({ inputData, mastra }) => {
+    if (!mastra) throw new Error('Mastra instance not available');
+    const sections = await organizeIntoSections(inputData.scoredArticles, inputData.topic, mastra);
+    return { sections, topic: inputData.topic };
+  },
+});
+
+// Step 5: Write the newsletter (fix #7: writes file directly)
+const writeNewsletterStep = createStep({
+  id: 'write-newsletter',
+  description: 'Compile the final markdown newsletter and write to file',
+  inputSchema: z.object({
+    sections: z.array(sectionSchema),
+    topic: z.string(),
+  }),
+  outputSchema: z.object({
+    markdown: z.string(),
+    filePath: z.string(),
+    topic: z.string(),
+  }),
+  execute: async ({ inputData, mastra }) => {
+    if (!mastra) throw new Error('Mastra instance not available');
+    const { markdown, filePath } = await writeNewsletterMarkdown(
+      inputData.sections,
+      inputData.topic,
+      mastra,
+    );
+    return { markdown, filePath, topic: inputData.topic };
   },
 });
 
@@ -340,11 +488,11 @@ const scoreNewsletterStep = createStep({
   execute: async ({ inputData }) => {
     const evaluation = await scoreNewsletter(inputData.markdown, inputData.topic);
 
-    console.log(`\n📊 Newsletter Quality Score: ${evaluation.overallScore}/10`);
-    console.log(`   Strengths: ${evaluation.strengths}`);
-    console.log(`   Weaknesses: ${evaluation.weaknesses}`);
+    console.log(`\nNewsletter Quality Score: ${evaluation.overallScore}/10`);
+    console.log(`  Strengths: ${evaluation.strengths}`);
+    console.log(`  Weaknesses: ${evaluation.weaknesses}`);
     if (evaluation.overallScore < 6) {
-      console.log(`   ⚠️  Score below 6 — will retry with refined topic: "${evaluation.improvementSuggestion}"`);
+      console.log(`  Score below 6 — will retry with refined topic: "${evaluation.improvementSuggestion}"`);
     }
 
     return {
@@ -359,7 +507,7 @@ const scoreNewsletterStep = createStep({
   },
 });
 
-// Branch A: Newsletter passes quality check (score >= 6) — return as-is
+// Branch A: Newsletter passes quality check (score >= 6)
 const passQualityStep = createStep({
   id: 'pass-quality',
   description: 'Newsletter passed quality check, return final result',
@@ -370,7 +518,7 @@ const passQualityStep = createStep({
     qualityScore: z.number(),
   }),
   execute: async ({ inputData }) => {
-    console.log(`\n✅ Newsletter passed quality check with score ${inputData.qualityScore}/10`);
+    console.log(`\nNewsletter passed quality check with score ${inputData.qualityScore}/10`);
     return {
       markdown: inputData.markdown,
       filePath: inputData.filePath,
@@ -379,7 +527,7 @@ const passQualityStep = createStep({
   },
 });
 
-// Branch B: Newsletter fails quality check (score < 6) — re-run entire pipeline with refined topic
+// Branch B: Newsletter fails quality check (score < 6) — fix #3: uses shared pipeline function
 const retryPipelineStep = createStep({
   id: 'retry-pipeline',
   description: 'Re-run the entire news pipeline with a refined, more detailed topic',
@@ -390,162 +538,28 @@ const retryPipelineStep = createStep({
     qualityScore: z.number(),
   }),
   execute: async ({ inputData, mastra }) => {
+    if (!mastra) throw new Error('Mastra instance not available');
+
     const refinedTopic = inputData.refinedTopic;
-    console.log(`\n🔄 Retrying pipeline with refined topic: "${refinedTopic}"`);
-    console.log(`   Original topic: "${inputData.topic}"`);
-    console.log(`   Previous score: ${inputData.qualityScore}/10`);
-    console.log(`   Reason: ${inputData.weaknesses}`);
+    console.log(`\nRetrying pipeline with refined topic: "${refinedTopic}"`);
+    console.log(`  Original topic: "${inputData.topic}"`);
+    console.log(`  Previous score: ${inputData.qualityScore}/10`);
+    console.log(`  Reason: ${inputData.weaknesses}`);
 
-    // --- Re-run the full pipeline inline with the refined topic ---
-
-    // 1. Parallel searches with refined topic
-    const ctx = {} as any;
-    const [exaResult1, exaResult2, tavilyResult, bbResult] = await Promise.all([
-      exaSearchTool.execute!({ query: `${refinedTopic} latest news`, numResults: 10 }, ctx),
-      exaSearchTool.execute!({ query: `${refinedTopic} breaking`, numResults: 10 }, ctx),
-      tavilySearchTool.execute!({ query: `${refinedTopic} news`, maxResults: 10 }, ctx),
-      browserbaseTool.execute!({
-        urls: [
-          `https://news.google.com/search?q=${encodeURIComponent(refinedTopic)}&hl=en-US&gl=US&ceid=US:en`,
-          `https://www.reuters.com/search/news?query=${encodeURIComponent(refinedTopic)}`,
-          `https://apnews.com/search?q=${encodeURIComponent(refinedTopic)}`,
-        ],
-      }, ctx),
-    ]);
-
-    // Merge all results
-    const allArticles = [
-      ...extractArticles(exaResult1),
-      ...extractArticles(exaResult2),
-      ...extractArticles(tavilyResult),
-      ...extractArticles(bbResult).map((a: any) => ({
-        title: a.title,
-        url: a.url,
-        summary: a.content?.slice(0, 500) || '',
-        source: new URL(a.url).hostname,
-        publishedDate: a.scrapedAt,
-      })),
-    ];
-
-    // Deduplicate
-    const seen = new Set<string>();
-    const uniqueArticles = allArticles.filter((a: any) => {
-      const normalizedUrl = a.url?.replace(/\/$/, '').toLowerCase();
-      if (!normalizedUrl || seen.has(normalizedUrl)) return false;
-      seen.add(normalizedUrl);
-      return true;
+    const result = await runNewsPipeline(refinedTopic, mastra, {
+      isRetry: true,
+      previousWeaknesses: inputData.weaknesses,
+      previousScore: inputData.qualityScore,
     });
 
-    // 2. Score articles
-    const scoredArticles: z.infer<typeof scoredArticleSchema>[] = [];
-    for (let i = 0; i < uniqueArticles.length; i += 5) {
-      const batch = uniqueArticles.slice(i, i + 5);
-      const scores = await scoreArticlesBatch(batch, refinedTopic);
-      for (let j = 0; j < batch.length; j++) {
-        const scoreData = scores[j] || { timeliness: 0.5, novelty: 0.5, urgency: 0.5, score: 0.5 };
-        scoredArticles.push({ ...batch[j], ...scoreData });
-      }
-    }
-    scoredArticles.sort((a, b) => b.score - a.score);
-    const topArticles = scoredArticles.slice(0, 20);
+    console.log(`\nRetry Newsletter Quality Score: ${result.qualityScore}/10`);
 
-    // 3. Organize into sections
-    const organizerAgent = mastra?.getAgent('newsOrganizerAgent');
-    if (!organizerAgent) throw new Error('News organizer agent not found');
-
-    const articleListText = topArticles
-      .map((a, i) => `[${i}] "${a.title}" (score: ${a.score.toFixed(2)}) - ${a.summary.slice(0, 200)}`)
-      .join('\n');
-
-    const orgResponse = await organizerAgent.generate(
-      [{
-        role: 'user' as const,
-        content: `Organize these ${topArticles.length} articles about "${refinedTopic}" into 3-4 themed sections. Each section needs a descriptive name and a creative, witty subheader.
-
-Articles:
-${articleListText}
-
-Return a JSON object with this structure:
-{
-  "sections": [{ "name": "Section Name", "theme": "Creative witty subheader", "articleIndices": [0, 1, 2] }]
-}
-
-Every article index must appear in exactly one section.`,
-      }],
-      {
-        structuredOutput: {
-          schema: z.object({
-            sections: z.array(z.object({
-              name: z.string(),
-              theme: z.string(),
-              articleIndices: z.array(z.number()),
-            })),
-          }),
-        },
-      },
-    );
-
-    const sections = (orgResponse.object?.sections || []).map((section) => ({
-      name: section.name,
-      theme: section.theme,
-      articles: (section.articleIndices || [])
-        .filter((idx) => idx < topArticles.length)
-        .map((idx) => topArticles[idx]),
-    }));
-
-    // 4. Write newsletter
-    const writerAgent = mastra?.getAgent('newsletterWriterAgent');
-    if (!writerAgent) throw new Error('Newsletter writer agent not found');
-
-    const sectionsText = sections
-      .map((s) => {
-        const details = s.articles
-          .map((a) => `- "${a.title}" | URL: ${a.url} | Source: ${a.source || 'unknown'} | Score: ${a.score.toFixed(2)}\n  Summary: ${a.summary.slice(0, 300)}`)
-          .join('\n');
-        return `## ${s.name}\n*${s.theme}*\n\n${details}`;
-      })
-      .join('\n\n');
-
-    const today = new Date().toISOString().split('T')[0];
-    const topicSlug = refinedTopic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-    const fileName = `${topicSlug}-${today}-retry.md`;
-
-    const writeResponse = await writerAgent.generate([{
-      role: 'user' as const,
-      content: `Write a complete markdown newsletter about "${refinedTopic}" for ${today}.
-
-Here are the organized sections with articles:
-
-${sectionsText}
-
-Requirements:
-- Start with a catchy title (# heading)
-- Include the date
-- Write a brief intro paragraph about the topic
-- For each section, use the section name as ## heading and the theme as an italic subtitle
-- For each article, write a 2-3 sentence summary and include a [Source](url) link
-- End with a witty sign-off
-- The newsletter should be professional, engaging, and informative
-- This is a RETRY — the previous version scored ${inputData.qualityScore}/10. Weaknesses were: ${inputData.weaknesses}. Make sure to address these.
-
-After writing the newsletter content, use the write-file tool to save it with the filename "${fileName}".`,
-    }]);
-
-    const retryMarkdown = writeResponse.text || '';
-
-    // 5. Score the retry
-    const retryEvaluation = await scoreNewsletter(retryMarkdown, refinedTopic);
-    console.log(`\n📊 Retry Newsletter Quality Score: ${retryEvaluation.overallScore}/10`);
-
-    return {
-      markdown: retryMarkdown,
-      filePath: `./reports/${fileName}`,
-      qualityScore: retryEvaluation.overallScore,
-    };
+    return result;
   },
 });
 
-// Assemble the workflow
+// --- Workflow assembly ---
+
 const newsWorkflow = createWorkflow({
   id: 'news-workflow',
   inputSchema: z.object({

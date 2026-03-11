@@ -77,7 +77,7 @@ export async function scoreArticle(
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'gpt-4.1-mini',
+      model: 'gpt-5-mini',
       response_format: { type: 'json_object' },
       messages: [
         {
@@ -124,7 +124,7 @@ export async function scoreArticlesBatch(
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'gpt-4.1-mini',
+      model: 'gpt-5-mini',
       response_format: { type: 'json_object' },
       messages: [
         {

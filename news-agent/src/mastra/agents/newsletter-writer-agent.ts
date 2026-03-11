@@ -1,5 +1,4 @@
 import { Agent } from '@mastra/core/agent';
-import { writeFileTool } from '../tools/write-file-tool';
 import { newsRelevanceScorer } from '../scorers/news-scorer';
 
 export const newsletterWriterAgent = new Agent({
@@ -17,15 +16,15 @@ Include:
 
 Style guidelines:
 - Be informative but conversational
-- Write at least 15 articles across all sections
+- Cover every article provided to you — do not skip any
 - Use markdown formatting (headers, bullet points, links, bold/italic)
 - Each section should flow naturally
 - Include [Source](url) links for every article
 - The newsletter should feel polished and professional
 
-After writing the newsletter, use the write-file tool to save it to disk.`,
+Output only the markdown content. The file will be saved automatically.`,
   model: 'openai/gpt-5-mini',
-  tools: { writeFileTool },
+  tools: {},
   scorers: {
     newsRelevance: {
       scorer: newsRelevanceScorer,
