@@ -11,11 +11,12 @@ import { newsResearcherAgent } from './agents/news-researcher-agent';
 import { newsOrganizerAgent } from './agents/news-organizer-agent';
 import { newsletterWriterAgent } from './agents/newsletter-writer-agent';
 import { newsRelevanceScorer } from './scorers/news-scorer';
+import { newsletterQualityScorer } from './scorers/newsletter-quality-scorer';
 
 export const mastra = new Mastra({
   workflows: { weatherWorkflow, newsWorkflow },
   agents: { weatherAgent, newsResearcherAgent, newsOrganizerAgent, newsletterWriterAgent },
-  scorers: { toolCallAppropriatenessScorer, completenessScorer, translationScorer, newsRelevanceScorer },
+  scorers: { toolCallAppropriatenessScorer, completenessScorer, translationScorer, newsRelevanceScorer, newsletterQualityScorer },
   storage: new LibSQLStore({
     id: "mastra-storage",
     // stores observability, scores, ... into persistent file storage
