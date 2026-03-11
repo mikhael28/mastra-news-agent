@@ -10,6 +10,8 @@ To get started, you will need to:
 - Go to the `Workflows` tab, click 'news-workflow' and in the 'Current Run' subheader on the expanded right sidebar, enter in plaintext the news topic you would like to research and report on.
 - Once the newsletter has been generated, you can view the local markdown artifact that is generated at `news-agent/src/mastra/public/reports`
 
+![Mastra News Agent Screenshot](./mastra-screenshot.png)
+
 **Workflow steps:**
 
 1. **Parallel search** — queries Exa (×2 queries), Tavily, and Google News / AP News RSS via feeds concurrently (replacing Browserbase)
