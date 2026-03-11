@@ -12,7 +12,7 @@ To get started, you will need to:
 
 **Workflow steps:**
 
-1. **Parallel search** — queries Exa (×2 queries), Tavily, and Google News / AP News RSS via BrowserBase feeds concurrently
+1. **Parallel search** — queries Exa (×2 queries), Tavily, and Google News / AP News RSS via feeds concurrently (replacing Browserbase)
 2. **Merge & deduplicate** — combines all results into a single deduplicated article list, stripping tracking parameters from URLs before comparison
 3. **Score & rank** — evaluates each article on timeliness, novelty, and urgency; keeps the top 20; scoring batches run in parallel
 4. **Organize** — an AI agent groups articles into 3–4 themed sections with creative subheaders
